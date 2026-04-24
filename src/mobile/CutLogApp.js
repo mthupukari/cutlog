@@ -1,4 +1,4 @@
-import { startTransition, useMemo, useState } from "react";
+import { startTransition, useEffect, useMemo, useState } from "react";
 import {
   Image,
   Pressable,
@@ -13,21 +13,15 @@ import {
 
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 
-import { createCoachResponse } from "../services/coachChat";
-import { sendMagicLink } from "../services/auth";
-import { estimatePhotoMacros, pickFoodPhoto } from "../services/photoAnalysis";
-import { generateWeeklyPlan, getPlanMeal, swapMealInPlan, toggleMealLock } from "../services/planner";
-import { colors, spacing, typography } from "../theme";
-import {
-  defaultAuthState,
-  defaultChatThread,
-  defaultFoodLogs,
-  defaultProfile,
-  defaultWaterEntries,
-  demoPhotoEstimate,
-  starterWeekPlan,
-} from "../data/mockData";
+import { defaultAuthState, defaultChatThread, defaultProfile, starterWeekPlan } from "../data/mockData";
 import { mealLibrary } from "../data/mealLibrary";
+import { createCoachResponse } from "../services/coachChat";
+import { getAuthBootstrap, sendMagicLink, subscribeToAuthChanges } from "../services/auth";
+import { captureFoodPhoto, estimatePhotoMacros, pickFoodPhoto } from "../services/photoAnalysis";
+import { formatDateLabel, getDateKey, loadJournalDay, saveFoodLogForDay, saveWaterForDay, shiftDateKey } from "../services/journal";
+import { generateWeeklyPlan, getPlanMeal, swapMealInPlan, toggleMealLock } from "../services/planner";
+import { updateProfile as persistProfile } from "../services/profile";
+import { colors, spacing, typography } from "../theme";
 
 const tabs = [
   { id: "today", label: "Today" },
@@ -64,6 +58,21 @@ function formatMealType(type) {
   if (type === "leftover") return "Leftover";
   if (type === "night_out") return "Night out";
   return "Prep";
+}
+
+function buildPlannedLogKey(item) {
+  return [item.day, item.meal?.title || item.label, item.type].join("::");
+}
+
+function isTodayDateKey(dateKey) {
+  return dateKey === getDateKey();
+}
+
+function formatLogTime(isoString) {
+  return new Date(isoString).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 function MacroCard({ label, value, helper, tone = "default" }) {
@@ -106,6 +115,38 @@ function TabButton({ label, active, onPress }) {
   );
 }
 
+function DaySwitcher({ selectedDateKey, onShiftDay, onJumpToToday, right }) {
+  const isToday = isTodayDateKey(selectedDateKey);
+
+  return (
+    <View style={styles.daySwitcher}>
+      <Pressable onPress={() => onShiftDay(-1)} style={styles.daySwitcherButton}>
+        <Text style={styles.daySwitcherArrow}>‹</Text>
+      </Pressable>
+      <View style={styles.daySwitcherCenter}>
+        <Text style={styles.daySwitcherLabel}>{formatDateLabel(selectedDateKey)}</Text>
+        <View style={styles.dayMetaRow}>
+          <Text style={styles.daySwitcherMeta}>{selectedDateKey}</Text>
+          <Pressable
+            onPress={onJumpToToday}
+            disabled={isToday}
+            style={[styles.todayChip, isToday && styles.todayChipActive]}
+          >
+            <Text style={[styles.todayChipLabel, isToday && styles.todayChipLabelActive]}>
+              {isToday ? "Today" : "Jump to today"}
+            </Text>
+          </Pressable>
+        </View>
+      </View>
+      {right || (
+        <Pressable onPress={() => onShiftDay(1)} style={styles.daySwitcherButton}>
+          <Text style={styles.daySwitcherArrow}>›</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
 function AuthGate({ email, onEmailChange, onSendMagicLink, statusMessage, onDemo }) {
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -138,22 +179,48 @@ function AuthGate({ email, onEmailChange, onSendMagicLink, statusMessage, onDemo
   );
 }
 
-function TodayScreen({ profile, totals, waterProgress, currentPlan, recentLogs, onAddWater }) {
+function TodayScreen({
+  profile,
+  selectedDateKey,
+  totals,
+  waterProgress,
+  currentPlan,
+  recentLogs,
+  dailySource,
+  onAddWater,
+  onShiftDay,
+  onJumpToToday,
+  onJumpToLog,
+  onLogPlannedMeal,
+}) {
   const todayMeals = currentPlan.planDays.slice(0, 3).map((day) => ({
     ...day,
     meal: getPlanMeal(day),
   }));
+  const loggedPlannedMealKeys = new Set(
+    recentLogs
+      .filter((log) => log.source === "planned_meal" && log.plannedLogKey)
+      .map((log) => log.plannedLogKey),
+  );
+  const remainingCalories = Math.max(profile.dailyCalorieTarget - totals.calories, 0);
+  const remainingProtein = Math.max(profile.dailyProteinTarget - totals.protein, 0);
 
   return (
     <ScrollView contentContainerStyle={styles.screenContent}>
       <Text style={styles.heroEyebrow}>Today</Text>
-      <Text style={styles.heroTitle}>Stay on the rails without overthinking every meal.</Text>
+      <Text style={styles.heroTitle}>A daily ledger for your cut, not another generic tracker.</Text>
+      <DaySwitcher
+        selectedDateKey={selectedDateKey}
+        onShiftDay={onShiftDay}
+        onJumpToToday={onJumpToToday}
+        right={<Text style={dailySource === "supabase" ? styles.syncChipLive : styles.syncChipDemo}>{dailySource === "supabase" ? "Saved" : "Demo"}</Text>}
+      />
+
       <View style={styles.heroBanner}>
         <View style={styles.heroTextWrap}>
           <Text style={styles.heroBannerTitle}>Cut phase target</Text>
           <Text style={styles.heroBannerBody}>
-            {profile.currentWeightLb} to {profile.goalWeightLb} lb by late season. Keep today around {profile.dailyCalorieTarget} cal
-            and {profile.dailyProteinTarget}g protein.
+            {profile.currentWeightLb} to {profile.goalWeightLb} lb. Today you have {remainingCalories} calories and {remainingProtein}g protein left to work with.
           </Text>
         </View>
       </View>
@@ -164,11 +231,7 @@ function TodayScreen({ profile, totals, waterProgress, currentPlan, recentLogs, 
         <MacroCard label="Water" value={`${waterProgress.consumedOz}oz`} helper={`${waterProgress.percent}% of goal`} tone="water" />
       </View>
 
-      <SectionCard
-        title="Hydration"
-        subtitle="Quick add for the water goal you actually care about"
-        right={<Text style={styles.sectionBadge}>{waterProgress.goalOz}oz goal</Text>}
-      >
+      <SectionCard title="Hydration" subtitle="Quick adds that make hitting the goal feel automatic" right={<Text style={styles.sectionBadge}>{waterProgress.goalOz}oz goal</Text>}>
         <View style={styles.pillRow}>
           {[12, 16, 24].map((amount) => (
             <Pressable key={amount} onPress={() => onAddWater(amount)} style={styles.pillButton}>
@@ -178,32 +241,66 @@ function TodayScreen({ profile, totals, waterProgress, currentPlan, recentLogs, 
         </View>
       </SectionCard>
 
-      <SectionCard title="Planned meals" subtitle="The next meals already budgeted into the day">
-        {todayMeals.map((item) => (
-          <View key={`${item.day}-${item.mealId || item.label}`} style={styles.listRow}>
-            <View style={styles.dayBadge}>
-              <Text style={styles.dayBadgeLabel}>{item.day}</Text>
+      <SectionCard
+        title="Daily nutrition ledger"
+        subtitle="Confirmed food entries saved against the selected date"
+        right={
+          <Pressable onPress={onJumpToLog} style={styles.inlineButton}>
+            <Text style={styles.inlineButtonLabel}>Add meal</Text>
+          </Pressable>
+        }
+      >
+        {recentLogs.length ? (
+          recentLogs.map((log) => (
+            <View key={log.id} style={styles.ledgerRow}>
+              <View style={styles.ledgerTimePill}>
+                <Text style={styles.ledgerTimeText}>{formatLogTime(log.eatenAt)}</Text>
+              </View>
+              <View style={styles.listRowCopy}>
+                <Text style={styles.listRowTitle}>{log.mealLabel}</Text>
+                <Text style={styles.listRowMeta}>{log.note}</Text>
+              </View>
+              <View style={styles.ledgerValueWrap}>
+                <Text style={styles.listRowValue}>{log.correctedMacros.calories}</Text>
+                <Text style={styles.listRowMeta}>cal</Text>
+              </View>
             </View>
-            <View style={styles.listRowCopy}>
-              <Text style={styles.listRowTitle}>{item.meal?.title || item.label}</Text>
-              <Text style={styles.listRowMeta}>{formatMealType(item.type)}</Text>
-            </View>
-            <Text style={styles.listRowValue}>{item.meal ? `${item.meal.macros.protein}g` : ""}</Text>
-          </View>
-        ))}
+          ))
+        ) : (
+          <Text style={styles.emptyStateCopy}>No confirmed meals saved for this day yet. Add a photo log or quick manual entry.</Text>
+        )}
       </SectionCard>
 
-      <SectionCard title="Recent logs" subtitle="Confirmed entries only count toward totals">
-        {recentLogs.map((log) => (
-          <View key={log.id} style={styles.listRow}>
-            <View style={styles.dot} />
-            <View style={styles.listRowCopy}>
-              <Text style={styles.listRowTitle}>{log.mealLabel}</Text>
-              <Text style={styles.listRowMeta}>{log.note}</Text>
+      <SectionCard title="Planned meals" subtitle="The next meals already budgeted into the week">
+        {todayMeals.map((item) => {
+          const isLogged = loggedPlannedMealKeys.has(buildPlannedLogKey(item));
+
+          return (
+            <View key={`${item.day}-${item.mealId || item.label}`} style={styles.listRow}>
+              <View style={styles.dayBadge}>
+                <Text style={styles.dayBadgeLabel}>{item.day}</Text>
+              </View>
+              <View style={styles.listRowCopy}>
+                <Text style={styles.listRowTitle}>{item.meal?.title || item.label}</Text>
+                <Text style={styles.listRowMeta}>{formatMealType(item.type)}</Text>
+              </View>
+              {item.meal ? (
+                <View style={styles.plannedMealActionWrap}>
+                  <Text style={styles.listRowValue}>{`${item.meal.macros.protein}g`}</Text>
+                  <Pressable
+                    onPress={() => onLogPlannedMeal(item)}
+                    disabled={isLogged}
+                    style={[styles.logPlannedChip, isLogged && styles.logPlannedChipDone]}
+                  >
+                    <Text style={[styles.logPlannedChipLabel, isLogged && styles.logPlannedChipLabelDone]}>{isLogged ? "Logged" : "Log"}</Text>
+                  </Pressable>
+                </View>
+              ) : (
+                <Text style={styles.listRowValue} />
+              )}
             </View>
-            <Text style={styles.listRowValue}>{log.correctedMacros.calories} cal</Text>
-          </View>
-        ))}
+          );
+        })}
       </SectionCard>
     </ScrollView>
   );
@@ -273,20 +370,45 @@ function PlanScreen({ currentPlan, onRegeneratePlan, onSwapMeal, onToggleLock })
 }
 
 function LogScreen({
+  selectedDateKey,
+  dailySource,
   foodLogs,
+  totals,
   pendingEstimate,
   note,
   onNoteChange,
+  onCapturePhoto,
   onPickPhoto,
   onUseDemoEstimate,
   onSaveEstimate,
   onAdjustEstimate,
   onManualQuickLog,
+  onShiftDay,
+  onJumpToToday,
 }) {
   return (
     <ScrollView contentContainerStyle={styles.screenContent}>
       <Text style={styles.heroEyebrow}>Food log</Text>
-      <Text style={styles.heroTitle}>Take a photo, review the estimate, then decide what counts.</Text>
+      <Text style={styles.heroTitle}>Photo in, calories out, then reviewed against the exact day.</Text>
+      <DaySwitcher
+        selectedDateKey={selectedDateKey}
+        onShiftDay={onShiftDay}
+        onJumpToToday={onJumpToToday}
+        right={<Text style={dailySource === "supabase" ? styles.syncChipLive : styles.syncChipDemo}>{dailySource === "supabase" ? "Cloud-backed" : "Saved locally"}</Text>}
+      />
+
+      <SectionCard title="Day summary" subtitle="Everything confirmed on this selected date">
+        <View style={styles.macroGrid}>
+          <MacroCard label="Entries" value={foodLogs.length} helper="saved meals" tone="default" />
+          <MacroCard label="Calories" value={totals.calories} helper="confirmed total" tone="accent" />
+          <MacroCard label="Protein" value={`${totals.protein}g`} helper="confirmed total" tone="success" />
+        </View>
+        <Text style={styles.storageHint}>
+          {dailySource === "supabase"
+            ? "This day is syncing against Supabase."
+            : "This day is currently being saved in the local demo journal."}
+        </Text>
+      </SectionCard>
 
       <SectionCard title="Photo logging" subtitle="AI estimates stay editable until you confirm them">
         <TextInput
@@ -298,6 +420,9 @@ function LogScreen({
           style={[styles.input, styles.textArea]}
         />
         <View style={styles.pillRow}>
+          <Pressable onPress={onCapturePhoto} style={styles.primaryButtonSmall}>
+            <Text style={styles.primaryButtonLabel}>Take photo</Text>
+          </Pressable>
           <Pressable onPress={onPickPhoto} style={styles.primaryButtonSmall}>
             <Text style={styles.primaryButtonLabel}>Choose photo</Text>
           </Pressable>
@@ -331,7 +456,7 @@ function LogScreen({
             ))}
           </View>
           <Pressable onPress={onSaveEstimate} style={styles.primaryButton}>
-            <Text style={styles.primaryButtonLabel}>Confirm and save</Text>
+            <Text style={styles.primaryButtonLabel}>Confirm for {formatDateLabel(selectedDateKey)}</Text>
           </Pressable>
         </SectionCard>
       ) : null}
@@ -342,20 +467,29 @@ function LogScreen({
         </Pressable>
       </SectionCard>
 
-      <SectionCard title="Saved meals" subtitle="Newest confirmed entries first">
-        {foodLogs
-          .slice()
-          .reverse()
-          .map((log) => (
-            <View key={log.id} style={styles.listRow}>
-              <View style={styles.dot} />
-              <View style={styles.listRowCopy}>
-                <Text style={styles.listRowTitle}>{log.mealLabel}</Text>
-                <Text style={styles.listRowMeta}>{log.note}</Text>
+      <SectionCard title="Saved meals" subtitle="Entries are grouped under the selected day">
+        {foodLogs.length ? (
+          foodLogs
+            .slice()
+            .reverse()
+            .map((log) => (
+              <View key={log.id} style={styles.ledgerRow}>
+                <View style={styles.ledgerTimePill}>
+                  <Text style={styles.ledgerTimeText}>{formatLogTime(log.eatenAt)}</Text>
+                </View>
+                <View style={styles.listRowCopy}>
+                  <Text style={styles.listRowTitle}>{log.mealLabel}</Text>
+                  <Text style={styles.listRowMeta}>{log.note}</Text>
+                </View>
+                <View style={styles.ledgerValueWrap}>
+                  <Text style={styles.listRowValue}>{log.correctedMacros.calories}</Text>
+                  <Text style={styles.listRowMeta}>cal</Text>
+                </View>
               </View>
-              <Text style={styles.listRowValue}>{log.correctedMacros.calories}</Text>
-            </View>
-          ))}
+            ))
+        ) : (
+          <Text style={styles.emptyStateCopy}>No saved meals on this date yet.</Text>
+        )}
       </SectionCard>
     </ScrollView>
   );
@@ -369,13 +503,8 @@ function ChatScreen({ messages, draft, onDraftChange, onSend, pendingAction, onA
 
       <SectionCard title="Thread" subtitle="Grounded in your current plan, logs, and hydration">
         {messages.map((message) => (
-          <View
-            key={message.id}
-            style={[styles.chatBubble, message.role === "user" ? styles.chatBubbleUser : styles.chatBubbleAssistant]}
-          >
-            <Text style={[styles.chatRole, message.role === "user" && styles.chatRoleUser]}>
-              {message.role === "user" ? "You" : "Coach"}
-            </Text>
+          <View key={message.id} style={[styles.chatBubble, message.role === "user" ? styles.chatBubbleUser : styles.chatBubbleAssistant]}>
+            <Text style={[styles.chatRole, message.role === "user" && styles.chatRoleUser]}>{message.role === "user" ? "You" : "Coach"}</Text>
             <Text style={[styles.chatBody, message.role === "user" && styles.chatBodyUser]}>{message.content}</Text>
           </View>
         ))}
@@ -461,8 +590,10 @@ export default function CutLogApp() {
   const [emailDraft, setEmailDraft] = useState(defaultAuthState.email);
   const [authMessage, setAuthMessage] = useState("");
   const [profile, setProfile] = useState(defaultProfile);
-  const [foodLogs, setFoodLogs] = useState(defaultFoodLogs);
-  const [waterEntries, setWaterEntries] = useState(defaultWaterEntries);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [selectedDateKey, setSelectedDateKey] = useState(getDateKey());
+  const [journalDay, setJournalDay] = useState({ foodLogs: [], waterEntries: [], source: "demo" });
+  const [journalLoading, setJournalLoading] = useState(true);
   const [currentPlan, setCurrentPlan] = useState(starterWeekPlan);
   const [chatMessages, setChatMessages] = useState(defaultChatThread.messages);
   const [chatDraft, setChatDraft] = useState("");
@@ -470,11 +601,68 @@ export default function CutLogApp() {
   const [logNote, setLogNote] = useState("");
   const [pendingEstimate, setPendingEstimate] = useState(null);
 
-  const totals = useMemo(() => sumTotals(foodLogs), [foodLogs]);
+  useEffect(() => {
+    let mounted = true;
+
+    async function bootstrapAuth() {
+      const bootstrap = await getAuthBootstrap();
+      if (!mounted) {
+        return;
+      }
+
+      setAuthState(bootstrap.authState);
+      setEmailDraft(bootstrap.authState.email);
+      setProfile(bootstrap.profile);
+      setAuthLoading(false);
+    }
+
+    bootstrapAuth();
+
+    const unsubscribe = subscribeToAuthChanges((nextState) => {
+      if (!mounted) {
+        return;
+      }
+
+      setAuthState(nextState.authState);
+      setEmailDraft(nextState.authState.email);
+      setProfile(nextState.profile);
+      setAuthLoading(false);
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function syncDay() {
+      setJournalLoading(true);
+      const day = await loadJournalDay(selectedDateKey);
+      if (!cancelled) {
+        setJournalDay(day);
+        setJournalLoading(false);
+      }
+    }
+
+    syncDay();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedDateKey]);
+
+  const totals = useMemo(() => sumTotals(journalDay.foodLogs), [journalDay.foodLogs]);
   const waterProgress = useMemo(
-    () => getWaterProgress(waterEntries, Number(profile.dailyWaterGoalOz)),
-    [profile.dailyWaterGoalOz, waterEntries],
+    () => getWaterProgress(journalDay.waterEntries, Number(profile.dailyWaterGoalOz)),
+    [journalDay.waterEntries, profile.dailyWaterGoalOz],
   );
+
+  async function refreshCurrentDay() {
+    setJournalDay(await loadJournalDay(selectedDateKey));
+  }
 
   async function handleSendMagicLink() {
     const result = await sendMagicLink(emailDraft);
@@ -482,22 +670,28 @@ export default function CutLogApp() {
   }
 
   function handleOpenDemo() {
-    setAuthState({
-      ...authState,
+    setAuthState((current) => ({
+      ...current,
       status: "signed_in",
       mode: "demo",
-    });
+    }));
   }
 
-  function addWater(amountOz) {
-    setWaterEntries((current) => [
-      ...current,
-      {
-        id: `water_${Date.now()}`,
-        amountOz,
-        loggedAt: new Date().toISOString(),
-      },
-    ]);
+  async function addWater(amountOz) {
+    const nextDay = await saveWaterForDay(selectedDateKey, {
+      id: `water_${Date.now()}`,
+      amountOz,
+      loggedAt: new Date().toISOString(),
+    });
+    setJournalDay(nextDay);
+  }
+
+  function shiftDay(amount) {
+    setSelectedDateKey((current) => shiftDateKey(current, amount));
+  }
+
+  function jumpToToday() {
+    setSelectedDateKey(getDateKey());
   }
 
   function regeneratePlan() {
@@ -528,9 +722,23 @@ export default function CutLogApp() {
     }
   }
 
+  async function handleCapturePhoto() {
+    try {
+      const asset = await captureFoodPhoto();
+      if (!asset) {
+        return;
+      }
+
+      const estimate = await estimatePhotoMacros({ photoAsset: asset, note: logNote });
+      setPendingEstimate(estimate);
+    } catch (error) {
+      setAuthMessage(error.message);
+    }
+  }
+
   async function handleUseDemoEstimate() {
     const estimate = await estimatePhotoMacros({ photoAsset: null, note: logNote || "chicken bowl" });
-    setPendingEstimate(estimate || demoPhotoEstimate);
+    setPendingEstimate(estimate);
   }
 
   function adjustEstimate(key, value) {
@@ -543,40 +751,70 @@ export default function CutLogApp() {
     }));
   }
 
-  function saveEstimate() {
+  async function saveEstimate() {
     if (!pendingEstimate) {
       return;
     }
 
-    setFoodLogs((current) => [
-      ...current,
-      {
-        id: `log_${Date.now()}`,
-        source: "photo",
-        mealLabel: pendingEstimate.mealLabel,
-        note: pendingEstimate.note || "Photo estimate",
-        eatenAt: new Date().toISOString(),
-        correctedMacros: pendingEstimate.macros,
-        photoUri: pendingEstimate.photoUri,
-      },
-    ]);
+    const nextDay = await saveFoodLogForDay(selectedDateKey, {
+      id: `log_${Date.now()}`,
+      source: "photo",
+      mealLabel: pendingEstimate.mealLabel,
+      note: pendingEstimate.note || "Photo estimate",
+      eatenAt: new Date().toISOString(),
+      correctedMacros: pendingEstimate.macros,
+      photoUri: pendingEstimate.photoUri,
+    });
+
+    setJournalDay(nextDay);
     setPendingEstimate(null);
     setLogNote("");
     setActiveTab("today");
   }
 
-  function addManualQuickLog() {
-    setFoodLogs((current) => [
-      ...current,
-      {
-        id: `manual_${Date.now()}`,
-        source: "manual",
-        mealLabel: "Office lunch",
-        note: "Quick add fallback",
-        eatenAt: new Date().toISOString(),
-        correctedMacros: { calories: 600, protein: 35, carbs: 55, fat: 22 },
+  async function addManualQuickLog() {
+    const nextDay = await saveFoodLogForDay(selectedDateKey, {
+      id: `manual_${Date.now()}`,
+      source: "manual",
+      mealLabel: "Office lunch",
+      note: "Quick add fallback",
+      eatenAt: new Date().toISOString(),
+      correctedMacros: { calories: 600, protein: 35, carbs: 55, fat: 22 },
+    });
+
+    setJournalDay(nextDay);
+  }
+
+  async function logPlannedMeal(item) {
+    if (!item?.meal) {
+      return;
+    }
+
+    const plannedLogKey = buildPlannedLogKey(item);
+    const alreadyLogged = journalDay.foodLogs.some(
+      (log) => log.source === "planned_meal" && log.plannedLogKey === plannedLogKey,
+    );
+
+    if (alreadyLogged) {
+      return;
+    }
+
+    const nextDay = await saveFoodLogForDay(selectedDateKey, {
+      id: `planned_${Date.now()}`,
+      source: "planned_meal",
+      mealLabel: item.meal.title,
+      note: `Logged from weekly plan · ${formatMealType(item.type)}`,
+      eatenAt: new Date().toISOString(),
+      plannedLogKey,
+      correctedMacros: {
+        calories: item.meal.macros.calories,
+        protein: item.meal.macros.protein,
+        carbs: item.meal.macros.carbs,
+        fat: item.meal.macros.fat,
       },
-    ]);
+    });
+
+    setJournalDay(nextDay);
   }
 
   function sendChatMessage() {
@@ -625,23 +863,42 @@ export default function CutLogApp() {
     setPendingAction(null);
   }
 
-  function handleProfileChange(key, value) {
-    setProfile((current) => ({
-      ...current,
+  async function commitProfileChange(key, value) {
+    const nextProfile = {
+      ...profile,
       [key]: key === "displayName" ? value : Number(value) || 0,
-    }));
+    };
+    setProfile(nextProfile);
+
+    try {
+      await persistProfile(nextProfile);
+    } catch (error) {
+      setAuthMessage(error.message || "Profile sync failed.");
+    }
   }
 
-  function resetDemoData() {
+  async function resetDemoData() {
     setProfile(defaultProfile);
-    setFoodLogs(defaultFoodLogs);
-    setWaterEntries(defaultWaterEntries);
     setCurrentPlan(starterWeekPlan);
     setChatMessages(defaultChatThread.messages);
     setPendingAction(null);
     setPendingEstimate(null);
     setLogNote("");
+    setSelectedDateKey(getDateKey());
     setActiveTab("today");
+    await refreshCurrentDay();
+  }
+
+  if (authLoading) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <ExpoStatusBar style="dark" />
+        <StatusBar barStyle="dark-content" />
+        <View style={styles.loadingWrap}>
+          <Text style={styles.loadingLabel}>Loading CutLog…</Text>
+        </View>
+      </SafeAreaView>
+    );
   }
 
   if (authState.status !== "signed_in") {
@@ -657,15 +914,27 @@ export default function CutLogApp() {
   }
 
   let screen = null;
-  if (activeTab === "today") {
+  if (journalLoading) {
+    screen = (
+      <View style={styles.loadingWrap}>
+        <Text style={styles.loadingLabel}>Loading your day…</Text>
+      </View>
+    );
+  } else if (activeTab === "today") {
     screen = (
       <TodayScreen
         profile={profile}
+        selectedDateKey={selectedDateKey}
         totals={totals}
         waterProgress={waterProgress}
         currentPlan={currentPlan}
-        recentLogs={foodLogs}
+        recentLogs={journalDay.foodLogs}
+        dailySource={journalDay.source}
         onAddWater={addWater}
+        onShiftDay={shiftDay}
+        onJumpToToday={jumpToToday}
+        onJumpToLog={() => setActiveTab("log")}
+        onLogPlannedMeal={logPlannedMeal}
       />
     );
   } else if (activeTab === "plan") {
@@ -673,15 +942,21 @@ export default function CutLogApp() {
   } else if (activeTab === "log") {
     screen = (
       <LogScreen
-        foodLogs={foodLogs}
+        selectedDateKey={selectedDateKey}
+        dailySource={journalDay.source}
+        foodLogs={journalDay.foodLogs}
+        totals={totals}
         pendingEstimate={pendingEstimate}
         note={logNote}
         onNoteChange={setLogNote}
+        onCapturePhoto={handleCapturePhoto}
         onPickPhoto={handlePickPhoto}
         onUseDemoEstimate={handleUseDemoEstimate}
         onSaveEstimate={saveEstimate}
         onAdjustEstimate={adjustEstimate}
         onManualQuickLog={addManualQuickLog}
+        onShiftDay={shiftDay}
+        onJumpToToday={jumpToToday}
       />
     );
   } else if (activeTab === "chat") {
@@ -696,9 +971,7 @@ export default function CutLogApp() {
       />
     );
   } else {
-    screen = (
-      <ProfileScreen profile={profile} onProfileChange={handleProfileChange} authState={authState} onResetDemo={resetDemoData} />
-    );
+    screen = <ProfileScreen profile={profile} onProfileChange={commitProfileChange} authState={authState} onResetDemo={resetDemoData} />;
   }
 
   return (
@@ -792,6 +1065,84 @@ const styles = StyleSheet.create({
     lineHeight: 36,
     color: colors.text,
     fontWeight: "700",
+  },
+  daySwitcher: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#efe4d5",
+    borderRadius: 22,
+    padding: 6,
+  },
+  daySwitcherButton: {
+    width: 42,
+    height: 42,
+    borderRadius: 16,
+    backgroundColor: colors.surface,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  daySwitcherArrow: {
+    color: colors.ink,
+    fontSize: 28,
+    lineHeight: 28,
+  },
+  daySwitcherCenter: {
+    flex: 1,
+    alignItems: "center",
+  },
+  dayMetaRow: {
+    marginTop: 2,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  daySwitcherLabel: {
+    color: colors.text,
+    fontSize: typography.subheading,
+    fontWeight: "700",
+  },
+  daySwitcherMeta: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: typography.caption,
+  },
+  todayChip: {
+    backgroundColor: colors.surface,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  todayChipActive: {
+    backgroundColor: colors.successSoft,
+  },
+  todayChipLabel: {
+    color: colors.ink,
+    fontSize: 11,
+    fontWeight: "700",
+  },
+  todayChipLabelActive: {
+    color: colors.success,
+  },
+  syncChipDemo: {
+    color: colors.ink,
+    backgroundColor: colors.surface,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 10,
+    borderRadius: 16,
+    overflow: "hidden",
+    fontWeight: "700",
+    fontSize: typography.caption,
+  },
+  syncChipLive: {
+    color: colors.success,
+    backgroundColor: colors.successSoft,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 10,
+    borderRadius: 16,
+    overflow: "hidden",
+    fontWeight: "700",
+    fontSize: typography.caption,
   },
   heroBanner: {
     borderRadius: 22,
@@ -920,6 +1271,30 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: colors.surfaceAlt,
   },
+  ledgerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    paddingVertical: spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: colors.surfaceAlt,
+  },
+  ledgerTimePill: {
+    minWidth: 64,
+    borderRadius: 14,
+    backgroundColor: "#efe4d5",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    alignItems: "center",
+  },
+  ledgerTimeText: {
+    color: colors.ink,
+    fontWeight: "700",
+    fontSize: typography.caption,
+  },
+  ledgerValueWrap: {
+    alignItems: "flex-end",
+  },
   listRowCompact: {
     flexDirection: "row",
     alignItems: "center",
@@ -962,6 +1337,36 @@ const styles = StyleSheet.create({
   listRowValue: {
     color: colors.accent,
     fontWeight: "700",
+  },
+  plannedMealActionWrap: {
+    alignItems: "flex-end",
+    gap: 6,
+  },
+  logPlannedChip: {
+    backgroundColor: colors.successSoft,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  logPlannedChipDone: {
+    backgroundColor: colors.surfaceAlt,
+  },
+  logPlannedChipLabel: {
+    color: colors.success,
+    fontWeight: "700",
+    fontSize: typography.caption,
+  },
+  logPlannedChipLabelDone: {
+    color: colors.muted,
+  },
+  emptyStateCopy: {
+    color: colors.muted,
+    lineHeight: 22,
+  },
+  storageHint: {
+    marginTop: spacing.md,
+    color: colors.muted,
+    lineHeight: 20,
   },
   screenHeaderRow: {
     flexDirection: "row",
@@ -1220,5 +1625,14 @@ const styles = StyleSheet.create({
     marginTop: spacing.md,
     color: colors.muted,
     lineHeight: 20,
+  },
+  loadingWrap: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  loadingLabel: {
+    color: colors.muted,
+    fontSize: typography.body,
   },
 });

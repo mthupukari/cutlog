@@ -2,6 +2,7 @@
   "expo": {
     "name": "CutLog",
     "slug": "cutlog",
+    "scheme": "cutlog",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
