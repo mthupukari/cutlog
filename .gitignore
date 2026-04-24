@@ -11,6 +11,10 @@ node_modules
 dist
 dist-ssr
 *.local
+.expo
+.expo-shared
+web-build
+expo-export
 
 # Editor directories and files
 .vscode/*
@@ -23,3 +27,7 @@ dist-ssr
 *.sln
 *.sw?
 .vercel
+.env
+
+# Agent files
+*.md

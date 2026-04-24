@@ -1,0 +1,33 @@
+{
+  "expo": {
+    "name": "CutLog",
+    "slug": "cutlog",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#f6f1e8"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.mahit.cutlog",
+      "infoPlist": {
+        "NSCameraUsageDescription": "CutLog uses the camera so you can log meals with a food photo.",
+        "NSPhotoLibraryUsageDescription": "CutLog uses your photo library so you can import meal photos for calorie tracking."
+      }
+    },
+    "android": {
+      "package": "com.mahit.cutlog"
+    },
+    "plugins": [
+      "expo-image-picker"
+    ],
+    "experiments": {
+      "typedRoutes": false
+    }
+  }
+}
